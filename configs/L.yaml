@@ -145,6 +145,6 @@ v_min: -1.0
 v_max: 1.0
 hl_sigma: 0.04
 
-magnet_policy: expander
+magnet_policy: uniform  # Original large-run setting: plain entropy.
 
 debug: false

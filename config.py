@@ -48,6 +48,7 @@ class Config:
     patch_size: int = 1
     conv_dim: int = 256
     use_bf16: bool = False
+    magnet_policy: str = "uniform"  # Uniform KL anchoring is plain entropy up to a constant.
 
     # Rollouts
     num_envs: int = 2048

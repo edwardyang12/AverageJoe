@@ -279,8 +279,8 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
         std = jnp.sqrt(jnp.maximum(mean_sq - mean ** 2, 0.0))
         return (advs - mean) / (std + 1e-8)
 
-    from train.magnet import expander_magnet
-    magnet_fn = expander_magnet
+    from train.magnet import get_magnet_fn
+    magnet_fn = get_magnet_fn(cfg.magnet_policy)
 
     def _ppo_step(params, opt_state, batch, key, ent_coef, sample_idx):
         network = eqx.combine(params, static)

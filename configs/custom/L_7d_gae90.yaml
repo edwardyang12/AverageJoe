@@ -71,6 +71,7 @@ target_kl: 0.02
 adv_top_frac: 0.25
 
 # Entropy
+magnet_policy: uniform  # Original large-run setting: plain entropy.
 ent_schedule: power_law
 ent_coef_start: 0.05
 ent_power: 0.2
