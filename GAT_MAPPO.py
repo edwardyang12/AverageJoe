@@ -11,9 +11,8 @@ os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.20"
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-# Enable headless Pygame video & audio drivers for screenless Docker containers
+# Enable headless Pygame rendering for screenless Docker containers
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
-os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
 import argparse
 import copy
@@ -140,8 +139,8 @@ def parse_args():
         help="use torch.compile on the GAT agent for fused CUDA kernels")
 
     # PPO & Optimization arguments (matching your YAML config)
-    parser.add_argument("--minibatch-size", type=int, default=4096,
-        help="minibatch size (4096 utilizes 48GB A40 VRAM to cut PPO time in half)")
+    parser.add_argument("--minibatch-size", type=int, default=2048,
+        help="minibatch size (2048 fits easily with 15x15 boards)")
     parser.add_argument("--update-epochs", type=int, default=1,
         help="epochs per iteration (num_epochs: 1)")
     parser.add_argument("--target-kl", type=float, default=0.02,
@@ -156,17 +155,17 @@ def parse_args():
         help="value loss coefficient beta (1.0 in config)")
     parser.add_argument("--max-grad-norm", type=float, default=0.5,
         help="maximum gradient norm clipping")
-    parser.add_argument("--adv-top-frac", type=float, default=0.25,
-        help="top-advantage filtering fraction (0.25 doubles PPO speed and focuses on high-leverage steps)")
+    parser.add_argument("--adv-top-frac", type=float, default=0.5,
+        help="top-advantage filtering fraction (0.5 in config)")
     parser.add_argument("--ema-decay", type=float, default=0.999,
         help="exponential moving average decay tau for deployment policy")
 
     # Optimizer Warmup + Cosine Decay Schedule (matching your YAML config!)
-    parser.add_argument("--lr", type=float, default=1.0e-4,
+    parser.add_argument("--lr", type=float, default=5.0e-5,
         help="peak learning rate after warmup")
-    parser.add_argument("--warmup-lr", type=float, default=1.0e-5,
+    parser.add_argument("--warmup-lr", type=float, default=1.0e-6,
         help="initial learning rate at iter 0")
-    parser.add_argument("--lr-warmup-iters", type=int, default=200,
+    parser.add_argument("--lr-warmup-iters", type=int, default=2000,
         help="linear warmup iterations from warmup_lr to lr")
     parser.add_argument("--final-lr", type=float, default=1.0e-5,
         help="final learning rate after cosine decay")
@@ -194,7 +193,6 @@ def parse_args():
     ]
     if args.config and os.path.exists(args.config):
         try:
-            import sys
             from ruamel.yaml import YAML
             yaml = YAML(typ="safe")
             with open(args.config, "r") as f:
@@ -209,22 +207,17 @@ def parse_args():
                 "v_max", "hl_sigma",
             ]:
                 if k in ycfg and ycfg[k] is not None:
-                    # ONLY override if the user didn't explicitly pass it via CLI
-                    cli_flag = f"--{k.replace('_', '-')}"
-                    if cli_flag not in sys.argv:
-                        setattr(args, k, ycfg[k])
-            
-            if "clip_eps" in ycfg and "--clip-coef" not in sys.argv:
+                    setattr(args, k, ycfg[k])
+            if "clip_eps" in ycfg:
                 args.clip_coef = float(ycfg["clip_eps"])
-            if "num_epochs" in ycfg and "--update-epochs" not in sys.argv:
+            if "num_epochs" in ycfg:
                 args.update_epochs = int(ycfg["num_epochs"])
-            if "embed_dim" in ycfg and "--d-model" not in sys.argv:
+            if "embed_dim" in ycfg:
                 args.d_model = int(ycfg["embed_dim"])
-            if "n_head" in ycfg and "--heads" not in sys.argv:
+            if "n_head" in ycfg:
                 args.heads = int(ycfg["n_head"])
-            if "ff_factor" in ycfg and "--ffn-mult" not in sys.argv:
+            if "ff_factor" in ycfg:
                 args.ffn_mult = int(ycfg["ff_factor"])
-            
             if "curriculum" in ycfg and ycfg["curriculum"]:
                 # Inherit reward_fn from previous stage if not specified in a stage
                 cur_list = []
@@ -272,25 +265,34 @@ def compute_scheduled_lr(it: int, args) -> float:
 # 1. FEATURE PARTITIONING & PREPROCESSING (Section 3 of Spec)
 # =====================================================================
 
+# Raw 38 channels -> Split into 32 Node Channels and 6 Global Scalar Channels
 NODE_CHANNEL_INDICES = [
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
-    20, 21,
-    22, 23,
-    *range(24, 38)
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,  # Instantaneous & masks
+    20, 21,                                         # Sticky per-cell enemy memory (MUST stay node-level!)
+    22, 23,                                         # Normalized coordinates coord_x, coord_y
+    *range(24, 38)                                  # 7-step own & enemy per-cell army deltas
 ]
-GLOBAL_CHANNEL_INDICES = [14, 15, 16, 17, 18, 19]
+GLOBAL_CHANNEL_INDICES = [14, 15, 16, 17, 18, 19]   # timestep, mod50, own/opp land & army totals
 
+# Indices within the 32-dim node vector that contain heavy-tailed army counts/deltas
 NODE_SYMLOG_INDICES = [0, 1, 2, 3, 14, *range(18, 32)]
 GLOBAL_SYMLOG_INDICES = [3, 5]
 
 
 def symlog(x: torch.Tensor) -> torch.Tensor:
+    """Smooth logarithmic compression for heavy-tailed army counts."""
     return torch.sign(x) * torch.log1p(torch.abs(x))
 
 
 def split_and_preprocess_obs(obs_38: torch.Tensor, already_normalized: bool = False):
-    global_s = obs_38[:, GLOBAL_CHANNEL_INDICES, 0, 0].to(torch.float32)
-    node_x = obs_38[:, NODE_CHANNEL_INDICES, :, :].to(torch.float32)
+    """
+    Splits (B, 38, H, W) tensor into:
+      - node_x: (B, 32, H, W) spatial node features
+      - global_s: (B, 6) board-level scalar features
+    """
+    # 1. Extract 6 global scalars from top-left cell
+    global_s = obs_38[:, GLOBAL_CHANNEL_INDICES, 0, 0].to(torch.float32)  # (B, 6)
+    node_x = obs_38[:, NODE_CHANNEL_INDICES, :, :].to(torch.float32)      # (B, 32, H, W)
 
     if not already_normalized:
         global_s = global_s.clone()
@@ -299,7 +301,6 @@ def split_and_preprocess_obs(obs_38: torch.Tensor, already_normalized: bool = Fa
         node_x[:, NODE_SYMLOG_INDICES, :, :] = symlog(node_x[:, NODE_SYMLOG_INDICES, :, :])
 
     return node_x, global_s
-
 
 # =====================================================================
 # 2. FAST 5x5 GRAPH ATTENTION + GLOBAL RELAY ARCHITECTURE (Section 5)
@@ -313,6 +314,15 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 
 class Fast5x5GATBlock(nn.Module):
+    """
+    High-Speed 5x5 Local Graph Attention + Global Relay Block.
+    Eliminates the 25x memory duplication of `F.unfold` by combining:
+      1. Multi-head 5x5 Depthwise-Separable Local Neighborhood Aggregation
+         with Context-Gated Attention Weights (O(N) memory, hardware-fused 5x5 kernel).
+      2. Bidirectional message passing between all N cell-agents and the 3 Global
+         Context Relay tokens so global fog-of-war beliefs propagate in O(1) hops!
+    Runs ~25x faster than `F.unfold` while preserving the exact 5x5 receptive field.
+    """
     def __init__(self, d_model: int, heads: int, ffn_mult: int = 3):
         super().__init__()
         self.d_model = d_model
@@ -320,17 +330,18 @@ class Fast5x5GATBlock(nn.Module):
         self.head_dim = d_model // heads
 
         self.norm1 = nn.LayerNorm(d_model)
+
+        # 5x5 Local Neighborhood Message Aggregator (k=25 relative positional weights per channel/head)
         self.local_v_proj = layer_init(nn.Linear(d_model, d_model, bias=False))
-        # Depthwise + Pointwise 5x5 Graph Convolution with zero directional bias
         self.local_5x5_conv = nn.Conv2d(
-            d_model, d_model, kernel_size=5, padding=2, groups=heads, bias=False
+            d_model, d_model, kernel_size=5, padding=2, groups=d_model, bias=True
         )
+        # Local GATv2-style context gate: sigmoid(W_q * h_u + W_k * N_5x5(u))
         self.local_gate_proj = layer_init(nn.Linear(d_model * 2, d_model))
         self.local_out_proj = layer_init(nn.Linear(d_model, d_model))
 
-        # Fast O(N) Global Relay Conditioning (replaces slow nn.MultiheadAttention fallback)
-        self.relay_proj = layer_init(nn.Linear(d_model * 3, d_model))
-        self.relay_gate = layer_init(nn.Linear(d_model * 2, d_model))
+        # Global Relay Cross-Attention (allows cells to query the 3 Global Context tokens)
+        self.relay_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=heads, batch_first=True)
 
         self.norm2 = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
@@ -347,7 +358,7 @@ class Fast5x5GATBlock(nn.Module):
         B, N, D = x.shape
         h = self.norm1(x)
 
-        # 1. 5x5 Multi-Head Local Graph Message Passing (Hardware-fused 5x5 kernel)
+        # 1. 5x5 Local Graph Message Passing (Hardware-fused 5x5 kernel, zero unfold allocation!)
         v_2d = self.local_v_proj(h).transpose(1, 2).reshape(B, D, H, W)
         nb_msg = self.local_5x5_conv(v_2d).reshape(B, D, N).transpose(1, 2)  # (B, N, D)
 
@@ -355,11 +366,8 @@ class Fast5x5GATBlock(nn.Module):
         attn_gate = torch.sigmoid(self.local_gate_proj(torch.cat([h, nb_msg], dim=-1)))
         local_out = self.local_out_proj(attn_gate * nb_msg)
 
-        # 2. Fast O(N) Global Relay Conditioning (no MQA/MHA kernel overhead!)
-        g_flat = global_tokens.reshape(B, 1, D * 3)
-        g_Broadcast = self.relay_proj(g_flat).expand(B, N, D)
-        r_gate = torch.sigmoid(self.relay_gate(torch.cat([h, g_Broadcast], dim=-1)))
-        relay_out = r_gate * g_Broadcast
+        # 2. Global Relay Message Passing (every cell attends to the 3 global scoreboard tokens)
+        relay_out, _ = self.relay_attn(query=h, key=global_tokens, value=global_tokens, need_weights=False)
 
         x = x + local_out + relay_out
         x = x + self.ffn(self.norm2(x))
@@ -853,17 +861,11 @@ class JAXGeneralsSelfPlayVecEnv:
             # Terminal win/lose reward (+1 / -1)
             r_term_p0 = jnp.where(terminated, jnp.where(winners == 0, 1.0, -1.0), 0.0)
 
-            # Fixed Dense Composite Reward Shaping:
-            # 1. Strong positive reward (+0.35) for capturing a castle + continuous holding bonus (+0.005/step per castle)
-            # 2. NEVER penalize `d_army < 0` when capturing neutral tiles/castles (which prevented castle captures!)
-            city_gain_p0 = jnp.maximum(owned_cities_p0 - prev_cities_p0, 0.0)
-            city_gain_p1 = jnp.maximum(owned_cities_p1 - prev_cities_p1, 0.0)
-            d_cities = (city_gain_p0 - city_gain_p1)
-            hold_cities = (owned_cities_p0 - owned_cities_p1) * 0.005
-
-            d_land = jnp.clip((post_land_diff - prev_land_diff) / 20.0, -0.1, 0.1)
-            d_army = jnp.clip((post_army_diff - prev_army_diff) / 200.0, 0.0, 0.05)  # Only reward net army growth, don't punish castle investment!
-            r_shaping_p0 = jnp.where(dones, 0.0, 0.35 * d_cities + hold_cities + 0.10 * d_land + d_army)
+            # Dense composite reward shaping (encourages capturing castles & expanding land/army in Stages 0-1!)
+            d_cities = (owned_cities_p0 - prev_cities_p0) - (owned_cities_p1 - prev_cities_p1)
+            d_land = (post_land_diff - prev_land_diff) / float(H * W)
+            d_army = jnp.clip((post_army_diff - prev_army_diff) / 100.0, -0.2, 0.2)
+            r_shaping_p0 = jnp.where(dones, 0.0, 0.15 * d_cities + 0.20 * d_land + 0.05 * d_army)
 
             r_p0 = r_term_p0 + jnp.where(use_composite_flag, r_shaping_p0, 0.0)
             r_p1 = -r_p0
@@ -968,25 +970,6 @@ class JAXGeneralsSelfPlayVecEnv:
         obs_38 = jnp.concatenate([base_channels, own_deltas, enemy_deltas], axis=1)
 
         new_temp = jnp.roll(obs_state["temporal"], shift=-1, axis=-1)
-        new_temp = new_temp.at[:, 0, -1].set(opp_army_tot)
-        new_temp = new_temp.at[:, 1, -1].set(opp_land)
-
-        new_obs_state = {
-            "seen": seen,
-            "enemy_seen": enemy_seen,
-            "generals": generals,
-            "castles": castles,
-            "mountains": mountains,
-            "last_enemy_army_seen": last_enemy_army,
-            "last_enemy_army_age": raw_age,
-            "prev_own_army": own_army,
-            "prev_enemy_army": enemy_army,
-            "own_army_deltas": own_deltas,
-            "enemy_army_deltas": enemy_deltas,
-            "temporal": new_temp,
-        }
-        return obs_38, new_temp, new_obs_state
-
     def update_curriculum_by_iter(self, it: int):
         """
         Advances curriculum stage based on the exact `iter:` schedule in your YAML config:
@@ -1310,7 +1293,6 @@ def record_replay_video_headless(
     if not isinstance(envs, JAXGeneralsSelfPlayVecEnv):
         return
     os.environ["SDL_VIDEODRIVER"] = "dummy"
-    os.environ["SDL_AUDIODRIVER"] = "dummy"
     try:
         import pygame
         import imageio
@@ -1335,11 +1317,7 @@ def record_replay_video_headless(
 
     def _grab():
         surf = pygame.display.get_surface()
-        arr = np.transpose(pygame.surfarray.array3d(surf), (1, 0, 2))
-        # Crop 1px if height or width is odd (e.g. 1086x751 -> 1086x750) so libx264 yuv420p succeeds
-        h_even = arr.shape[0] - (arr.shape[0] % 2)
-        w_even = arr.shape[1] - (arr.shape[1] % 2)
-        return arr[:h_even, :w_even, :].copy()
+        return np.transpose(pygame.surfarray.array3d(surf), (1, 0, 2)).copy()
 
     gui.tick(fps=None)
     frames.append(_grab())
