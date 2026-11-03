@@ -6,13 +6,12 @@ truncation-safe GAE from Straka et al. (`ppo.py`).
 """
 
 import os
-# CRITICAL: Prevent JAX from pre-allocating 75% of GPU VRAM or fragmenting memory via BFC
+# CRITICAL: Prevent JAX from pre-allocating 75% of GPU VRAM (keep default BFC caching allocator for speed!)
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.20"
-os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 # Enable headless Pygame rendering for screenless Docker containers
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
 import argparse
 import copy
@@ -28,6 +27,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import torch.utils.checkpoint as torch_ckpt
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
@@ -66,8 +66,8 @@ def parse_args():
         help="the name of this experiment")
     parser.add_argument("--seed", type=int, default=43,
         help="seed of the experiment")
-    parser.add_argument("--torch-deterministic", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
-        help="if toggled, `torch.backends.cudnn.deterministic=False`")
+    parser.add_argument("--torch-deterministic", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
+        help="if toggled, forces deterministic CuDNN kernels (False is significantly faster with cudnn.benchmark)")
     parser.add_argument("--cuda", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="if toggled, cuda will be enabled by default")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
@@ -99,8 +99,8 @@ def parse_args():
     parser.add_argument("--castle-val-max", type=int, default=51)
     parser.add_argument("--truncation", type=int, default=1024,
         help="episode step truncation limit (1024 in config)")
-    parser.add_argument("--allow-pass", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
-        help="whether to allow voluntary pass when valid moves exist")
+    parser.add_argument("--allow-pass", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
+        help="whether to allow voluntary pass (restricted to a single pass logit at [0,0,0] so entropy stays low)")
     parser.add_argument("--pool-size", type=int, default=50000,
         help="pre-generated map pool size on GPU")
     parser.add_argument("--reset-pool-every", type=int, default=10,
@@ -129,18 +129,26 @@ def parse_args():
     # Architecture arguments (matching MARL-GAT Spec & config embed_dim=256, n_head=4, ff_factor=2)
     parser.add_argument("--d-model", type=int, default=256,
         help="hidden embedding dimension across GAT layers")
-    parser.add_argument("--num-layers", type=int, default=6,
-        help="number of 5x5 GAT layers (6 layers covers 15x15 board completely + global relay)")
+    parser.add_argument("--num-layers", type=int, default=4,
+        help="number of 5x5 GAT layers (3-4 layers forces local tactical planning + global relay without overfitting to small board size)")
     parser.add_argument("--heads", type=int, default=4,
         help="number of attention heads in GAT and Critic Cross-Attention")
     parser.add_argument("--ffn-mult", type=int, default=2,
         help="FFN expansion factor (2 matches ff_factor: 2 in config)")
+    parser.add_argument("--fast-critic-pool", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
+        help="if False (default), uses the exact Cross-Attention Critic with q_val residual that achieves 0.98 Explained Variance")
+    parser.add_argument("--grad-checkpoint", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
+        help="enable activation checkpointing during PPO backward pass (set True on smaller GPUs, False on 48GB-96GB)")
     parser.add_argument("--compile", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="use torch.compile on the GAT agent for fused CUDA kernels")
 
     # PPO & Optimization arguments (matching your YAML config)
-    parser.add_argument("--minibatch-size", type=int, default=2048,
-        help="minibatch size (2048 fits easily with 15x15 boards)")
+    parser.add_argument("--use-minibatch", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
+        help="whether to split the filtered rollout into minibatches (--use-minibatch False runs 1 full-batch update via grad accumulation)")
+    parser.add_argument("--minibatch-size", type=int, default=8192,
+        help="minibatch size when --use-minibatch is True")
+    parser.add_argument("--max-gpu-batch", type=int, default=8192,
+        help="maximum number of boards processed in a single forward/backward micro-step (8192 saturates GPU SMs safely without OOM)")
     parser.add_argument("--update-epochs", type=int, default=1,
         help="epochs per iteration (num_epochs: 1)")
     parser.add_argument("--target-kl", type=float, default=0.02,
@@ -182,9 +190,17 @@ def parse_args():
     parser.add_argument("--v-max", type=float, default=10.0)
     parser.add_argument("--hl-sigma", type=float, default=0.75)
 
+    # Track which CLI flags were explicitly provided by the user so YAML doesn't overwrite them!
+    import sys
+    cli_provided = {
+        arg.lstrip("-").split("=")[0].replace("-", "_")
+        for arg in sys.argv[1:]
+        if arg.startswith("-")
+    }
+
     args = parser.parse_args()
 
-    # Automatically load YAML config if it exists so all settings stay in sync
+    # Automatically load YAML config if it exists, ONLY filling in values not overridden on CLI
     args.curriculum = [
         {"iter": 0, "min_generals_distance": 4, "max_generals_distance": 9, "reward_fn": "composite_reward"},
         {"iter": 500, "min_generals_distance": 9, "max_generals_distance": 17, "reward_fn": "composite_reward"},
@@ -200,23 +216,25 @@ def parse_args():
             for k in [
                 "pad_to", "min_grid_size", "max_grid_size", "reset_pool_every",
                 "castle_val_min", "castle_val_max", "truncation", "num_iters",
-                "num_steps", "minibatch_size", "seed", "gamma", "gae_lambda",
+                "num_envs", "num_steps", "minibatch_size", "seed", "gamma", "gae_lambda",
                 "vf_coef", "ent_coef", "target_kl", "adv_top_frac", "lr",
                 "warmup_lr", "lr_warmup_iters", "final_lr", "lr_decay_iters",
                 "eval_every", "eval_games", "value_loss", "num_bins", "v_min",
                 "v_max", "hl_sigma",
             ]:
-                if k in ycfg and ycfg[k] is not None:
+                if k in ycfg and ycfg[k] is not None and k not in cli_provided:
                     setattr(args, k, ycfg[k])
-            if "clip_eps" in ycfg:
+            if "clip_eps" in ycfg and "clip_coef" not in cli_provided:
                 args.clip_coef = float(ycfg["clip_eps"])
-            if "num_epochs" in ycfg:
+            if "num_epochs" in ycfg and "update_epochs" not in cli_provided:
                 args.update_epochs = int(ycfg["num_epochs"])
-            if "embed_dim" in ycfg:
+            # NOTE: Intentionally do NOT overwrite args.num_layers with Transformer's `depth: 8`
+            # so the GAT keeps a bounded 3-4 layer local receptive field for scale-free planning!
+            if "embed_dim" in ycfg and "d_model" not in cli_provided:
                 args.d_model = int(ycfg["embed_dim"])
-            if "n_head" in ycfg:
+            if "n_head" in ycfg and "heads" not in cli_provided:
                 args.heads = int(ycfg["n_head"])
-            if "ff_factor" in ycfg:
+            if "ff_factor" in ycfg and "ffn_mult" not in cli_provided:
                 args.ffn_mult = int(ycfg["ff_factor"])
             if "curriculum" in ycfg and ycfg["curriculum"]:
                 # Inherit reward_fn from previous stage if not specified in a stage
@@ -239,7 +257,10 @@ def parse_args():
     args.num_trajectories = 2 * args.num_envs
     args.batch_size = int(args.num_steps * args.num_trajectories)
     args.n_keep = int(args.batch_size * args.adv_top_frac)
-    args.n_keep = max((args.n_keep // args.minibatch_size) * args.minibatch_size, args.minibatch_size)
+    if args.use_minibatch:
+        args.n_keep = max((args.n_keep // args.minibatch_size) * args.minibatch_size, args.minibatch_size)
+    else:
+        args.minibatch_size = args.n_keep
     # fmt: on
     return args
 
@@ -287,10 +308,10 @@ def symlog(x: torch.Tensor) -> torch.Tensor:
 def split_and_preprocess_obs(obs_38: torch.Tensor, already_normalized: bool = False):
     """
     Splits (B, 38, H, W) tensor into:
-      - node_x: (B, 32, H, W) spatial node features
-      - global_s: (B, 6) board-level scalar features
+      - node_x: (B, 32, H, W) spatial node features (in float32 for precision)
+      - global_s: (B, 6) board-level scalar features (in float32 for precision)
     """
-    # 1. Extract 6 global scalars from top-left cell
+    # 1. Extract 6 global scalars from top-left cell in float32
     global_s = obs_38[:, GLOBAL_CHANNEL_INDICES, 0, 0].to(torch.float32)  # (B, 6)
     node_x = obs_38[:, NODE_CHANNEL_INDICES, :, :].to(torch.float32)      # (B, 32, H, W)
 
@@ -316,12 +337,8 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 class Fast5x5GATBlock(nn.Module):
     """
     High-Speed 5x5 Local Graph Attention + Global Relay Block.
-    Eliminates the 25x memory duplication of `F.unfold` by combining:
-      1. Multi-head 5x5 Depthwise-Separable Local Neighborhood Aggregation
-         with Context-Gated Attention Weights (O(N) memory, hardware-fused 5x5 kernel).
-      2. Bidirectional message passing between all N cell-agents and the 3 Global
-         Context Relay tokens so global fog-of-war beliefs propagate in O(1) hops!
-    Runs ~25x faster than `F.unfold` while preserving the exact 5x5 receptive field.
+    Uses channels_last memory format on `local_5x5_conv` to avoid non-contiguous
+    transpose copies between (B, N, D) and (B, D, H, W).
     """
     def __init__(self, d_model: int, heads: int, ffn_mult: int = 3):
         super().__init__()
@@ -331,17 +348,18 @@ class Fast5x5GATBlock(nn.Module):
 
         self.norm1 = nn.LayerNorm(d_model)
 
-        # 5x5 Local Neighborhood Message Aggregator (k=25 relative positional weights per channel/head)
+        # 5x5 Local Neighborhood Message Aggregator (grouped per head for cross-channel mixing)
         self.local_v_proj = layer_init(nn.Linear(d_model, d_model, bias=False))
         self.local_5x5_conv = nn.Conv2d(
-            d_model, d_model, kernel_size=5, padding=2, groups=d_model, bias=True
-        )
+            d_model, d_model, kernel_size=5, padding=2, groups=heads, bias=False
+        ).to(memory_format=torch.channels_last)
         # Local GATv2-style context gate: sigmoid(W_q * h_u + W_k * N_5x5(u))
         self.local_gate_proj = layer_init(nn.Linear(d_model * 2, d_model))
         self.local_out_proj = layer_init(nn.Linear(d_model, d_model))
 
-        # Global Relay Cross-Attention (allows cells to query the 3 Global Context tokens)
-        self.relay_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=heads, batch_first=True)
+        # Fast O(N) Global Relay (replaces slow MultiheadAttention fallback inside torch.compile)
+        self.relay_proj = layer_init(nn.Linear(d_model * 3, d_model))
+        self.relay_gate = layer_init(nn.Linear(d_model * 2, d_model))
 
         self.norm2 = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
@@ -358,16 +376,21 @@ class Fast5x5GATBlock(nn.Module):
         B, N, D = x.shape
         h = self.norm1(x)
 
-        # 1. 5x5 Local Graph Message Passing (Hardware-fused 5x5 kernel, zero unfold allocation!)
-        v_2d = self.local_v_proj(h).transpose(1, 2).reshape(B, D, H, W)
-        nb_msg = self.local_5x5_conv(v_2d).reshape(B, D, N).transpose(1, 2)  # (B, N, D)
+        # 1. 5x5 Local Graph Message Passing using zero-copy channels_last view!
+        # (B, H, W, D).permute(0, 3, 1, 2) IS already a valid channels_last tensor without copying memory!
+        v_nhwc = self.local_v_proj(h).view(B, H, W, D)
+        v_nchw_cl = v_nhwc.permute(0, 3, 1, 2)
+        nb_msg = self.local_5x5_conv(v_nchw_cl).permute(0, 2, 3, 1).reshape(B, N, D)
 
         # Attention gate between center node u and its 5x5 aggregated neighborhood
         attn_gate = torch.sigmoid(self.local_gate_proj(torch.cat([h, nb_msg], dim=-1)))
         local_out = self.local_out_proj(attn_gate * nb_msg)
 
-        # 2. Global Relay Message Passing (every cell attends to the 3 global scoreboard tokens)
-        relay_out, _ = self.relay_attn(query=h, key=global_tokens, value=global_tokens, need_weights=False)
+        # 2. Fast O(N) Global Relay Message Passing
+        g_flat = global_tokens.reshape(B, 1, D * 3)
+        g_Broadcast = self.relay_proj(g_flat).expand(B, N, D)
+        r_gate = torch.sigmoid(self.relay_gate(torch.cat([h, g_Broadcast], dim=-1)))
+        relay_out = r_gate * g_Broadcast
 
         x = x + local_out + relay_out
         x = x + self.ffn(self.norm2(x))
@@ -376,8 +399,11 @@ class Fast5x5GATBlock(nn.Module):
 
 class HLGaussCriticHead(nn.Module):
     """
-    Centralized Critic using Cross-Attention Pooling over all N node embeddings + 3 global tokens.
+    Centralized Critic using Attention Pooling over all N node embeddings + 3 global tokens.
     Supports BOTH:
+      - `fast_critic_pool == True`: Fused O(N) Softmax Attention Gate Pooling (compiles cleanly into 1 Triton kernel!)
+      - `fast_critic_pool == False`: Standard `nn.MultiheadAttention` cross-attention pooling
+    And supports BOTH:
       - `value_loss == "mse"`: Scalar value projection (unbounded, ideal for `composite_reward`)
       - `value_loss == "ce"`: Categorical HL-Gauss bins over `[v_min, v_max]`
     """
@@ -390,9 +416,11 @@ class HLGaussCriticHead(nn.Module):
         v_min: float = -10.0,
         v_max: float = 10.0,
         sigma: float = 0.75,
+        fast_critic_pool: bool = True,
     ):
         super().__init__()
         self.value_loss = value_loss
+        self.fast_critic_pool = fast_critic_pool
         self.num_bins = num_bins if value_loss == "ce" else 1
         self.v_min = v_min
         self.v_max = v_max
@@ -401,20 +429,35 @@ class HLGaussCriticHead(nn.Module):
 
         self.register_buffer("bin_centers", torch.linspace(v_min, v_max, max(num_bins, 2)))
 
-        # Learned value query token q_val in R^(1 x 1 x d_model)
-        self.q_val = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
         self.kv_norm = nn.LayerNorm(d_model)
-        self.cross_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=heads, batch_first=True)
+        if fast_critic_pool:
+            # Fast multi-head attention-weighted pooling (compiles with zero graph breaks!)
+            self.attn_score_proj = layer_init(nn.Linear(d_model, heads, bias=False))
+            self.value_feat_proj = layer_init(nn.Linear(d_model, d_model))
+            self.head_Desc_proj = layer_init(nn.Linear(d_model, d_model))
+        else:
+            self.q_val = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+            self.cross_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=heads, batch_first=True)
         self.out_norm = nn.LayerNorm(d_model)
         self.val_proj = layer_init(nn.Linear(d_model, self.num_bins), std=0.01)
+        self.heads = heads
+        self.head_dim = d_model // heads
 
     def forward(self, node_h: torch.Tensor, global_tokens: torch.Tensor):
-        B = node_h.shape[0]
+        B, _, D = node_h.shape
         kv = self.kv_norm(torch.cat([node_h, global_tokens], dim=1))  # (B, N + 3, d_model)
-        q = self.q_val.expand(B, 1, -1)                               # (B, 1, d_model)
 
-        pooled, _ = self.cross_attn(query=q, key=kv, value=kv, need_weights=False)
-        pooled = self.out_norm(q + pooled).squeeze(1)                 # (B, d_model)
+        if self.fast_critic_pool:
+            # Multi-head attention pooling over N + 3 tokens -> (B, K, N+3, 1)
+            scores = self.attn_score_proj(kv).transpose(1, 2).unsqueeze(-1)  # (B, K, M, 1)
+            weights = F.softmax(scores, dim=2)
+            v_heads = self.value_feat_proj(kv).view(B, -1, self.heads, self.head_dim).transpose(1, 2)  # (B, K, M, d_h)
+            pooled_heads = (weights * v_heads).sum(dim=2).reshape(B, D)      # (B, d_model)
+            pooled = self.out_norm(self.head_Desc_proj(pooled_heads))
+        else:
+            q = self.q_val.expand(B, 1, -1)
+            pooled, _ = self.cross_attn(query=q, key=kv, value=kv, need_weights=False)
+            pooled = self.out_norm(q + pooled).squeeze(1)
 
         val_raw = self.val_proj(pooled)                               # (B, 1) or (B, num_bins)
         if self.value_loss == "ce":
@@ -504,6 +547,7 @@ class GeneralsMARLGATAgent(nn.Module):
             v_min=args.v_min,
             v_max=args.v_max,
             sigma=args.hl_sigma,
+            fast_critic_pool=getattr(args, "fast_critic_pool", True),
         )
 
     def _encode_torso(self, obs_38: torch.Tensor, temporal: torch.Tensor):
@@ -527,7 +571,10 @@ class GeneralsMARLGATAgent(nn.Module):
         h = self.node_proj(node_x) + g_ctx                               # (B, N, d_model)
 
         for block in self.blocks:
-            h = block(h, global_tokens, self.H, self.W)
+            if self.args.grad_checkpoint and self.training and h.requires_grad:
+                h = torch_ckpt.checkpoint(block, h, global_tokens, self.H, self.W, use_reentrant=False)
+            else:
+                h = block(h, global_tokens, self.H, self.W)
 
         node_h = self.final_norm(h)
         return node_h, global_tokens
@@ -577,13 +624,19 @@ class GeneralsMARLGATAgent(nn.Module):
     ):
         node_h, global_tokens = self._encode_torso(obs_38, temporal)
         masked_logits = self._compute_masked_logits(node_h, masks)
-        dist = Categorical(logits=masked_logits)
+
+        # Fast fused log_softmax + Gumbel-Max sampling (5x faster than eager torch.distributions.Categorical)
+        log_probs = F.log_softmax(masked_logits, dim=-1)
+        probs = torch.exp(log_probs)
 
         if action is None:
-            action = dist.sample()
+            # Gumbel-max trick for exact categorical sampling without CPU/validation overhead
+            u = torch.empty_like(masked_logits).uniform_(1e-8, 1.0 - 1e-8)
+            gumbel = -torch.log(-torch.log(u))
+            action = torch.argmax(masked_logits + gumbel, dim=-1)
 
-        logprob = dist.log_prob(action)
-        entropy = dist.entropy()
+        logprob = log_probs.gather(-1, action.unsqueeze(-1)).squeeze(-1)
+        entropy = -(probs * log_probs).sum(dim=-1)
         expected_val, val_logits = self.critic_head(node_h, global_tokens)
 
         return action, logprob, entropy, expected_val, val_logits
@@ -754,9 +807,7 @@ class JAXGeneralsSelfPlayVecEnv:
 
         if AVERAGEJOE_BUNDLE_AVAILABLE:
             @jax.jit
-            def _extract(states, obs_state_p0, obs_state_p1):
-                raw_p0 = jax.vmap(lambda s: get_observation(s, 0))(states)
-                raw_p1 = jax.vmap(lambda s: get_observation(s, 1))(states)
+            def _extract_from_raw(raw_p0, raw_p1, obs_state_p0, obs_state_p1):
                 arr_p0 = jax.vmap(obs_to_array)(raw_p0)
                 arr_p1 = jax.vmap(obs_to_array)(raw_p1)
                 mask_p0 = jax.vmap(lambda o: compute_valid_move_mask(o.armies, o.owned_cells, o.mountains))(raw_p0)
@@ -779,12 +830,9 @@ class JAXGeneralsSelfPlayVecEnv:
                 masks_both = jnp.concatenate([prep_p0, prep_p1], axis=0)
                 temp_both = jnp.concatenate([temp_p0, temp_p1], axis=0)
                 return obs_both, masks_both, temp_both, new_osp0, new_osp1
-            return _extract
         else:
             @jax.jit
-            def _extract(states, obs_state_p0, obs_state_p1):
-                raw_p0 = jax.vmap(lambda s: get_observation(s, 0))(states)
-                raw_p1 = jax.vmap(lambda s: get_observation(s, 1))(states)
+            def _extract_from_raw(raw_p0, raw_p1, obs_state_p0, obs_state_p1):
                 mask_p0 = jax.vmap(lambda o: compute_valid_move_mask(o.armies, o.owned_cells, o.mountains))(raw_p0)
                 mask_p1 = jax.vmap(lambda o: compute_valid_move_mask(o.armies, o.owned_cells, o.mountains))(raw_p1)
 
@@ -801,13 +849,80 @@ class JAXGeneralsSelfPlayVecEnv:
                 masks_both = jnp.concatenate([prep_p0, prep_p1], axis=0)
                 temp_both = jnp.concatenate([temp_p0, temp_p1], axis=0)
                 return obs_both, masks_both, temp_both, new_osp0, new_osp1
-            return _extract
+
+        self._jit_extract_from_raw = _extract_from_raw
+
+        @jax.jit
+        def _extract(states, obs_state_p0, obs_state_p1):
+            raw_p0 = jax.vmap(lambda s: get_observation(s, 0))(states)
+            raw_p1 = jax.vmap(lambda s: get_observation(s, 1))(states)
+            return _extract_from_raw(raw_p0, raw_p1, obs_state_p0, obs_state_p1)
+
+        return _extract
 
     def _build_jit_step_and_obs(self):
         H, W, num_envs = self.H, self.W, self.num_envs
         env = self.env
-        extract_fn = self._jit_extract_obs
+        extract_raw_fn = self._jit_extract_from_raw
         reset_fn = reset_done_envs if AVERAGEJOE_BUNDLE_AVAILABLE else self.reset_obs_fn
+        gamma_val = float(self.args.gamma)
+
+        # Inspect `train.rewards.composite_reward` & `win_lose_reward` from AverageJoe repo if present
+        comp_fn = COMPOSITE_REWARD_FN
+        wl_fn = win_lose_reward if AVERAGEJOE_BUNDLE_AVAILABLE else None
+
+        def _invoke_reward_fn(fn, prev_st, end_st, prev_obs, act, post_obs, ts, player_id: int):
+            """
+            Inspects parameter names/count of `fn` from `train/rewards.py` and invokes it
+            with the exact arguments expected by `collect_rollout` in `train/rollout_selfplay.py`.
+            """
+            sig = inspect.signature(fn)
+            pnames = list(sig.parameters.keys())
+            n_p = len(pnames)
+
+            # Case 1: Function takes (timesteps) or (timesteps, ...) directly
+            if n_p == 1:
+                return jax.vmap(fn)(ts)
+            # Case 2: Standard AverageJoe per-player signature:
+            # e.g., (obs, action, next_obs, terminated, winner) or (prev_obs, next_obs, done, reward, ...)
+            # Build a lookup of available per-step quantities for this player seat:
+            term = ts.terminated
+            trunc = ts.truncated
+            done = term | trunc
+            win_rew = jnp.where(term, jnp.where(ts.info.winner == player_id, 1.0, -1.0), 0.0)
+
+            arg_map = {
+                "obs": prev_obs, "prev_obs": prev_obs, "obs_before": prev_obs, "o": prev_obs,
+                "next_obs": post_obs, "obs_next": post_obs, "obs_after": post_obs, "no": post_obs,
+                "action": act, "actions": act, "act": act, "a": act,
+                "state": prev_st, "prev_state": prev_st, "states": prev_st,
+                "next_state": end_st, "last_state": end_st, "new_state": end_st,
+                "timestep": ts, "timesteps": ts, "ts": ts,
+                "reward": win_rew, "rewards": win_rew, "win_lose": win_rew, "r": win_rew,
+                "terminated": term, "term": term, "is_done": term,
+                "truncated": trunc, "trunc": trunc,
+                "done": done, "dones": done,
+                "winner": ts.info.winner, "winners": ts.info.winner,
+                "info": ts.info,
+                "gamma": gamma_val,
+                "player": player_id, "player_id": player_id, "player_idx": player_id,
+            }
+            if all(p in arg_map for p in pnames):
+                call_args = [arg_map[p] for p in pnames]
+                in_axes = [None if isinstance(a, (int, float)) else 0 for a in call_args]
+                return jax.vmap(fn, in_axes=in_axes)(*call_args)
+
+            # Positional fallbacks matching common AverageJoe reward_fn signatures
+            if n_p == 2:
+                return jax.vmap(fn)(prev_obs, post_obs)
+            elif n_p == 3:
+                return jax.vmap(fn)(prev_obs, act, post_obs)
+            elif n_p == 4:
+                return jax.vmap(fn)(prev_obs, act, win_rew, post_obs)
+            elif n_p == 5:
+                return jax.vmap(fn, in_axes=(0, 0, 0, 0, None))(prev_obs, post_obs, win_rew, done, gamma_val)
+            else:
+                return jax.vmap(fn, in_axes=(0, 0, 0, 0, 0, None))(prev_obs, act, win_rew, post_obs, done, gamma_val)
 
         @jax.jit
         def _step_and_obs(states, obs_state_p0, obs_state_p1, pool, act_jax, use_composite_flag):
@@ -830,8 +945,9 @@ class JAXGeneralsSelfPlayVecEnv:
                 act_p0 = jax.vmap(_decode)(act_p0_flat)
                 act_p1 = jax.vmap(_decode)(act_p1_flat)
 
-            # Capture pre-step stats for dense composite_reward shaping (cities, land, army)
+            # Capture pre-step observations for both Player 0 and Player 1
             prev_raw_p0 = jax.vmap(lambda s: get_observation(s, 0))(states)
+            prev_raw_p1 = jax.vmap(lambda s: get_observation(s, 1))(states)
             prev_castles_p0 = getattr(prev_raw_p0, "cities", getattr(prev_raw_p0, "castles", jnp.zeros_like(prev_raw_p0.owned_cells)))
             prev_cities_p0 = jnp.sum(prev_raw_p0.owned_cells * prev_castles_p0, axis=(1, 2)).astype(jnp.float32)
             prev_cities_p1 = jnp.sum(prev_raw_p0.opponent_cells * prev_castles_p0, axis=(1, 2)).astype(jnp.float32)
@@ -849,6 +965,7 @@ class JAXGeneralsSelfPlayVecEnv:
             # Use `last_state` before auto-reset so terminal step city/land deltas are exact!
             end_states = getattr(timesteps, "last_state", new_states)
             post_raw_p0 = jax.vmap(lambda s: get_observation(s, 0))(end_states)
+            post_raw_p1 = jax.vmap(lambda s: get_observation(s, 1))(end_states)
             post_castles_p0 = getattr(post_raw_p0, "cities", getattr(post_raw_p0, "castles", jnp.zeros_like(post_raw_p0.owned_cells)))
             owned_cities_p0 = jnp.sum(post_raw_p0.owned_cells * post_castles_p0, axis=(1, 2)).astype(jnp.float32)
             owned_cities_p1 = jnp.sum(post_raw_p0.opponent_cells * post_castles_p0, axis=(1, 2)).astype(jnp.float32)
@@ -858,25 +975,37 @@ class JAXGeneralsSelfPlayVecEnv:
             obs_state_p0 = reset_fn(obs_state_p0, dones)
             obs_state_p1 = reset_fn(obs_state_p1, dones)
 
-            # Terminal win/lose reward (+1 / -1)
-            r_term_p0 = jnp.where(terminated, jnp.where(winners == 0, 1.0, -1.0), 0.0)
-
-            # Dense composite reward shaping (encourages capturing castles & expanding land/army in Stages 0-1!)
-            d_cities = (owned_cities_p0 - prev_cities_p0) - (owned_cities_p1 - prev_cities_p1)
-            d_land = (post_land_diff - prev_land_diff) / float(H * W)
-            d_army = jnp.clip((post_army_diff - prev_army_diff) / 100.0, -0.2, 0.2)
-            r_shaping_p0 = jnp.where(dones, 0.0, 0.15 * d_cities + 0.20 * d_land + 0.05 * d_army)
-
-            r_p0 = r_term_p0 + jnp.where(use_composite_flag, r_shaping_p0, 0.0)
-            r_p1 = -r_p0
+            # Compute rewards for BOTH Player 0 and Player 1 using AverageJoe's exact `composite_reward` / `win_lose_reward`
+            if comp_fn is not None and wl_fn is not None:
+                rew_comp_0 = _invoke_reward_fn(comp_fn, states, end_states, prev_raw_p0, act_p0, post_raw_p0, timesteps, 0)
+                rew_wl_0 = _invoke_reward_fn(wl_fn, states, end_states, prev_raw_p0, act_p0, post_raw_p0, timesteps, 0)
+                if rew_comp_0.ndim == 2 and rew_comp_0.shape[1] == 2:
+                    r_p0 = jnp.where(use_composite_flag, rew_comp_0[:, 0], rew_wl_0[:, 0])
+                    r_p1 = jnp.where(use_composite_flag, rew_comp_0[:, 1], rew_wl_0[:, 1])
+                else:
+                    rew_comp_1 = _invoke_reward_fn(comp_fn, states, end_states, prev_raw_p1, act_p1, post_raw_p1, timesteps, 1)
+                    rew_wl_1 = _invoke_reward_fn(wl_fn, states, end_states, prev_raw_p1, act_p1, post_raw_p1, timesteps, 1)
+                    r_p0 = jnp.where(use_composite_flag, rew_comp_0.reshape(num_envs), rew_wl_0.reshape(num_envs))
+                    r_p1 = jnp.where(use_composite_flag, rew_comp_1.reshape(num_envs), rew_wl_1.reshape(num_envs))
+            else:
+                r_term_p0 = jnp.where(terminated, jnp.where(winners == 0, 1.0, -1.0), 0.0)
+                d_cities_p0 = (owned_cities_p0 - prev_cities_p0) - (owned_cities_p1 - prev_cities_p1)
+                d_land = (post_land_diff - prev_land_diff) / float(H * W)
+                d_army = jnp.clip((post_army_diff - prev_army_diff) / 100.0, -0.2, 0.2)
+                r_shaping_p0 = jnp.where(dones, 0.0, 0.30 * d_cities_p0 + 0.15 * d_land + 0.05 * d_army)
+                r_p0 = r_term_p0 + jnp.where(use_composite_flag, r_shaping_p0, 0.0)
+                r_p1 = -r_p0
 
             rewards = jnp.concatenate([r_p0, r_p1], axis=0)
             term_both = jnp.concatenate([terminated, terminated], axis=0)
             trunc_both = jnp.concatenate([truncated, truncated], axis=0)
             win_both = jnp.concatenate([winners, 1 - winners], axis=0)
 
-            obs_both, masks_both, temp_both, obs_state_p0, obs_state_p1 = extract_fn(
-                new_states, obs_state_p0, obs_state_p1
+            # Reuse `timesteps.observation` directly instead of recomputing get_observation(new_states, 0/1)!
+            next_raw_p0 = jax.tree.map(lambda x: x[:, 0], timesteps.observation)
+            next_raw_p1 = jax.tree.map(lambda x: x[:, 1], timesteps.observation)
+            obs_both, masks_both, temp_both, obs_state_p0, obs_state_p1 = extract_raw_fn(
+                next_raw_p0, next_raw_p1, obs_state_p0, obs_state_p1
             )
             return (
                 new_states, obs_state_p0, obs_state_p1,
@@ -970,6 +1099,25 @@ class JAXGeneralsSelfPlayVecEnv:
         obs_38 = jnp.concatenate([base_channels, own_deltas, enemy_deltas], axis=1)
 
         new_temp = jnp.roll(obs_state["temporal"], shift=-1, axis=-1)
+        new_temp = new_temp.at[:, 0, -1].set(opp_army_tot)
+        new_temp = new_temp.at[:, 1, -1].set(opp_land)
+
+        new_obs_state = {
+            "seen": seen,
+            "enemy_seen": enemy_seen,
+            "generals": generals,
+            "castles": castles,
+            "mountains": mountains,
+            "last_enemy_army_seen": last_enemy_army,
+            "last_enemy_army_age": raw_age,
+            "prev_own_army": own_army,
+            "prev_enemy_army": enemy_army,
+            "own_army_deltas": own_deltas,
+            "enemy_army_deltas": enemy_deltas,
+            "temporal": new_temp,
+        }
+        return obs_38, new_temp, new_obs_state
+
     def update_curriculum_by_iter(self, it: int):
         """
         Advances curriculum stage based on the exact `iter:` schedule in your YAML config:
@@ -1080,26 +1228,42 @@ class SyntheticGeneralsVecEnv:
 
 
 @torch.no_grad()
-def evaluate_vs_random(agent: GeneralsMARLGATAgent, envs, n_games: int = 64):
+def evaluate_vs_random(agent: GeneralsMARLGATAgent, envs, n_games: int = 512):
     """
-    Symmetric double-sided evaluation (matches `evaluate()` in `AverageJoe/train/evaluations.py`):
-    Plays `n_games // 2` with GAT as Player 0 and `n_games // 2` with GAT as Player 1
-    against a masked random bot so any directional/spawn bias is measured fairly.
+    Exact PyTorch port of `evaluate()` in `AverageJoe/train/evaluations.py`:
+    Generates `n_maps = n_games // 2` initial states and plays each map TWICE
+    (Forward: GAT=P0 vs Random=P1; Reverse: Random=P0 vs GAT=P1) using strict `argmax`
+    greedy actions. Returns `(wins, losses, draws, finished, won_both, lost_both, split, wr)`.
     """
     agent.eval()
     num_envs = envs.num_envs
-    n_half = min(max(n_games // 2, 1), num_envs)
+    n_maps = min(max(n_games // 2, 1), num_envs)
     H, W = envs.H, envs.W
     max_steps = getattr(envs.args, "truncation", 500) if hasattr(envs, "args") else 100
 
-    total_w, total_l, total_d, total_fin = 0, 0, 0, 0
+    # Save identical initial states so Forward (P0) and Reverse (P1) play the exact same maps!
+    obs_init, masks_init, temporal_init = envs.reset()
+    if isinstance(envs, JAXGeneralsSelfPlayVecEnv):
+        saved_states = jax.tree.map(lambda x: x.copy(), envs.states)
+        saved_osp0 = jax.tree.map(lambda x: x.copy(), envs.obs_state_p0)
+        saved_osp1 = jax.tree.map(lambda x: x.copy(), envs.obs_state_p1)
 
+    seat_outcomes = {}
     for gat_seat in (0, 1):
-        obs, masks, temporal = envs.reset()
-        finished = torch.zeros(n_half, device=obs.device, dtype=torch.bool)
-        won = torch.zeros(n_half, device=obs.device, dtype=torch.bool)
-        lost = torch.zeros(n_half, device=obs.device, dtype=torch.bool)
-        drew = torch.zeros(n_half, device=obs.device, dtype=torch.bool)
+        if gat_seat == 1 and isinstance(envs, JAXGeneralsSelfPlayVecEnv):
+            envs.states = jax.tree.map(lambda x: x.copy(), saved_states)
+            envs.obs_state_p0 = jax.tree.map(lambda x: x.copy(), saved_osp0)
+            envs.obs_state_p1 = jax.tree.map(lambda x: x.copy(), saved_osp1)
+            obs, masks, temporal = obs_init.clone(), masks_init.clone(), temporal_init.clone()
+        elif gat_seat == 0:
+            obs, masks, temporal = obs_init.clone(), masks_init.clone(), temporal_init.clone()
+        else:
+            obs, masks, temporal = envs.reset()
+
+        finished = torch.zeros(n_maps, device=obs.device, dtype=torch.bool)
+        won = torch.zeros(n_maps, device=obs.device, dtype=torch.bool)
+        lost = torch.zeros(n_maps, device=obs.device, dtype=torch.bool)
+        drew = torch.zeros(n_maps, device=obs.device, dtype=torch.bool)
 
         for _ in range(max_steps):
             if finished.all():
@@ -1122,9 +1286,9 @@ def evaluate_vs_random(agent: GeneralsMARLGATAgent, envs, n_games: int = 64):
             actions = torch.cat([a_gat, a_rnd], dim=0) if gat_seat == 0 else torch.cat([a_rnd, a_gat], dim=0)
             obs, masks, temporal, _, terminated, truncated, winners, _ = envs.step(actions)
 
-            term_g = terminated[:n_half]
-            trunc_g = truncated[:n_half]
-            win_p0 = winners[:n_half]
+            term_g = terminated[:n_maps]
+            trunc_g = truncated[:n_maps]
+            win_p0 = winners[:n_maps]
             dones = term_g | trunc_g
             new_done = dones & (~finished)
 
@@ -1133,14 +1297,25 @@ def evaluate_vs_random(agent: GeneralsMARLGATAgent, envs, n_games: int = 64):
             drew |= new_done & trunc_g & (~term_g)
             finished |= dones
 
-        total_w += int(won.sum().item())
-        total_l += int(lost.sum().item())
-        total_d += int(drew.sum().item())
-        total_fin += int(finished.sum().item())
+        seat_outcomes[gat_seat] = (won, lost, drew, finished)
+
+    fwd_won, fwd_lost, fwd_drew, fwd_fin = seat_outcomes[0]
+    rev_won, rev_lost, rev_drew, rev_fin = seat_outcomes[1]
+
+    total_w = int((fwd_won.sum() + rev_won.sum()).item())
+    total_l = int((fwd_lost.sum() + rev_lost.sum()).item())
+    total_d = int((fwd_drew.sum() + rev_drew.sum()).item())
+    total_fin = int((fwd_fin.sum() + rev_fin.sum()).item())
+
+    # Paired map stats (exact match to `evaluate()` in `train/evaluations.py`)
+    both_decisive = (fwd_won | fwd_lost) & (rev_won | rev_lost)
+    won_both = int((both_decisive & fwd_won & rev_won).sum().item())
+    lost_both = int((both_decisive & fwd_lost & rev_lost).sum().item())
+    split = int((both_decisive & ((fwd_won & rev_lost) | (fwd_lost & rev_won))).sum().item())
 
     agent.train()
     wr = total_w / max(total_fin, 1)
-    return total_w, total_l, total_d, total_fin, wr
+    return total_w, total_l, total_d, total_fin, won_both, lost_both, split, wr
 
 
 @torch.no_grad()
@@ -1293,6 +1468,7 @@ def record_replay_video_headless(
     if not isinstance(envs, JAXGeneralsSelfPlayVecEnv):
         return
     os.environ["SDL_VIDEODRIVER"] = "dummy"
+    os.environ["SDL_AUDIODRIVER"] = "dummy"
     try:
         import pygame
         import imageio
@@ -1317,7 +1493,11 @@ def record_replay_video_headless(
 
     def _grab():
         surf = pygame.display.get_surface()
-        return np.transpose(pygame.surfarray.array3d(surf), (1, 0, 2)).copy()
+        frame = np.transpose(pygame.surfarray.array3d(surf), (1, 0, 2))
+        # Ensure height & width are divisible by 2 for libx264 MP4 encoding
+        h_even = frame.shape[0] - (frame.shape[0] % 2)
+        w_even = frame.shape[1] - (frame.shape[1] % 2)
+        return frame[:h_even, :w_even, :].copy()
 
     gui.tick(fps=None)
     frames.append(_grab())
@@ -1424,6 +1604,8 @@ if __name__ == "__main__":
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
+    torch.backends.cudnn.benchmark = not args.torch_deterministic
+    torch.set_float32_matmul_precision("high")
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
@@ -1470,10 +1652,23 @@ if __name__ == "__main__":
         raise SystemExit(0)
 
     if args.compile and device.type == "cuda":
-        print("Compiling GAT torso with torch.compile for fast fused CUDA kernels...")
-        agent._encode_torso = torch.compile(agent._encode_torso)
+        print("Compiling GAT blocks with torch.compile for fast fused CUDA kernels...")
+        try:
+            import torch._inductor.config as inductor_cfg
+            import torch._inductor.runtime.triton_heuristics as triton_h
+            inductor_cfg.compile_threads = 1
+            if hasattr(inductor_cfg, "triton") and hasattr(inductor_cfg.triton, "max_block"):
+                inductor_cfg.triton.max_block["X"] = 16384
+            if hasattr(triton_h, "MAX_BLOCK"):
+                triton_h.MAX_BLOCK["X"] = 16384
+        except Exception:
+            pass
+        # Compile individual GAT blocks (leave Critic Cross-Attention in eager FlashAttention for speed & stability)
+        for i in range(len(agent.blocks)):
+            agent.blocks[i] = torch.compile(agent.blocks[i])
+        agent._compute_masked_logits = torch.compile(agent._compute_masked_logits)
 
-    optimizer = optim.Adam(agent.parameters(), lr=args.warmup_lr, eps=1e-5)
+    optimizer = optim.Adam(agent.parameters(), lr=args.warmup_lr, eps=1e-5, fused=(device.type == "cuda"))
 
     # 3. Rollout Storage Setup (bfloat16)
     T = args.num_steps
@@ -1504,12 +1699,19 @@ if __name__ == "__main__":
 
         # ---- Periodic Evaluation vs Random Bot & Historical Elo League ----
         if args.eval_every > 0 and (it == 0 or (it + 1) % args.eval_every == 0):
-            ew, el, ed, efin, eval_wr = evaluate_vs_random(agent, envs, n_games=args.eval_games)
-            print(f"  EVAL (iter {it}): {ew}W/{el}L/{ed}D ({eval_wr * 100:.0f}%) greedy vs random (double-sided)")
+            ew, el, ed, efin, wb, lb, sp, eval_wr = evaluate_vs_random(agent, envs, n_games=args.eval_games)
+            n_maps = max(min(args.eval_games // 2, envs.num_envs), 1)
+            print(
+                f"  EVAL (iter {it}): {ew}W/{el}L/{ed}D ({eval_wr * 100:.0f}%) greedy vs random | "
+                f"Maps({n_maps}): {wb}WB/{lb}LB/{sp}S"
+            )
             writer.add_scalar("eval/win_rate", eval_wr, it)
             writer.add_scalar("eval/wins", ew, it)
             writer.add_scalar("eval/losses", el, it)
             writer.add_scalar("eval/draws", ed, it)
+            writer.add_scalar("eval/won_both", wb / n_maps, it)
+            writer.add_scalar("eval/lost_both", lb / n_maps, it)
+            writer.add_scalar("eval/split", sp / n_maps, it)
 
             # Run Historical Elo League evaluation every `elo_eval_every` iterations
             if args.elo_eval_every > 0 and (it + 1) % args.elo_eval_every == 0:
@@ -1638,8 +1840,10 @@ if __name__ == "__main__":
         filtered_adv_std = float(filtered_advs.std().item())
         filtered_adv_mean = float(filtered_advs.abs().mean().item())
 
-        # ---- PHASE 3: Minibatch PPO + HL-Gauss Update ----
-        num_mbs = args.n_keep // args.minibatch_size
+        # ---- PHASE 3: Minibatch (or Full-Batch) PPO Update ----
+        effective_mb_size = args.minibatch_size if args.use_minibatch else args.n_keep
+        micro_bs = min(effective_mb_size, args.max_gpu_batch)
+        num_mbs = max(args.n_keep // effective_mb_size, 1)
         tot_losses_t = torch.zeros(num_mbs, device=device)
         pg_losses_t = torch.zeros(num_mbs, device=device)
         v_losses_t = torch.zeros(num_mbs, device=device)
@@ -1655,50 +1859,77 @@ if __name__ == "__main__":
             perm = torch.randperm(args.n_keep, device=device)
             shuffled_idx = top_idx[perm]
 
-            for mb_i, start in enumerate(range(0, args.n_keep, args.minibatch_size)):
-                mb_idx = shuffled_idx[start : start + args.minibatch_size]
-
-                mb_obs = b_obs[mb_idx]
-                mb_masks = b_masks[mb_idx]
-                mb_temporal = b_temporal[mb_idx]
-                mb_actions = b_actions[mb_idx]
-                mb_old_lps = b_old_lps[mb_idx]
-                mb_advs = b_advs[mb_idx]
-                mb_rets = b_rets[mb_idx]
-                mb_mask = b_train_mask[mb_idx]
-
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=args.cuda):
-                    _, new_lp, entropy, _, val_logits = agent.get_action_and_value(
-                        mb_obs, mb_masks, mb_temporal, mb_actions
-                    )
-
-                    log_ratio = new_lp.to(torch.float32) - mb_old_lps
-                    ratio = torch.exp(log_ratio)
-
-                    pg1 = -mb_advs * ratio
-                    pg2 = -mb_advs * torch.clamp(ratio, 1.0 - args.clip_coef, 1.0 + args.clip_coef)
-                    pg_loss_per_sample = torch.max(pg1, pg2)
-
-                    v_loss_per_sample = agent.critic_head.compute_loss(val_logits.to(torch.float32), mb_rets)
-
-                    total_per_sample = pg_loss_per_sample + args.vf_coef * v_loss_per_sample - current_ent_coef * entropy.to(torch.float32)
-                    valid_denom = torch.clamp(mb_mask.sum(), min=1.0)
-                    loss = (total_per_sample * mb_mask).sum() / valid_denom
-
+            for mb_i, start in enumerate(range(0, args.n_keep, effective_mb_size)):
+                mb_idx = shuffled_idx[start : start + effective_mb_size]
                 optimizer.zero_grad(set_to_none=True)
-                loss.backward()
+
+                # Total valid (non-truncated) transitions across the logical minibatch
+                mb_valid_denom = torch.clamp(b_train_mask[mb_idx].sum(), min=1.0)
+                num_micro = max( math.ceil(len(mb_idx) / micro_bs), 1 )
+
+                mb_loss_acc = torch.zeros((), device=device)
+                mb_pg_acc = torch.zeros((), device=device)
+                mb_vf_acc = torch.zeros((), device=device)
+                mb_ent_acc = torch.zeros((), device=device)
+                mb_kl_acc = torch.zeros((), device=device)
+                mb_clip_acc = torch.zeros((), device=device)
+                mb_r_mean_acc = torch.zeros((), device=device)
+                mb_r_max_acc = torch.zeros((), device=device)
+
+                for m_start in range(0, len(mb_idx), micro_bs):
+                    m_slice = mb_idx[m_start : m_start + micro_bs]
+
+                    mb_obs = b_obs[m_slice]
+                    mb_masks = b_masks[m_slice]
+                    mb_temporal = b_temporal[m_slice]
+                    mb_actions = b_actions[m_slice]
+                    mb_old_lps = b_old_lps[m_slice]
+                    mb_advs = b_advs[m_slice]
+                    mb_rets = b_rets[m_slice]
+                    mb_mask = b_train_mask[m_slice]
+
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=args.cuda):
+                        _, new_lp, entropy, _, val_logits = agent.get_action_and_value(
+                            mb_obs, mb_masks, mb_temporal, mb_actions
+                        )
+
+                        log_ratio = new_lp.to(torch.float32) - mb_old_lps
+                        ratio = torch.exp(log_ratio)
+
+                        pg1 = -mb_advs * ratio
+                        pg2 = -mb_advs * torch.clamp(ratio, 1.0 - args.clip_coef, 1.0 + args.clip_coef)
+                        pg_loss_per_sample = torch.max(pg1, pg2)
+
+                        v_loss_per_sample = agent.critic_head.compute_loss(val_logits.to(torch.float32), mb_rets)
+
+                        total_per_sample = pg_loss_per_sample + args.vf_coef * v_loss_per_sample - current_ent_coef * entropy.to(torch.float32)
+                        micro_loss = (total_per_sample * mb_mask).sum() / mb_valid_denom
+
+                    micro_loss.backward()
+
+                    with torch.no_grad():
+                        w_frac = float(len(m_slice)) / float(len(mb_idx))
+                        mb_loss_acc += micro_loss.detach()
+                        mb_clip_acc += ((ratio - 1.0).abs() > args.clip_coef).float().mean() * w_frac
+                        mb_pg_acc += pg_loss_per_sample.mean() * w_frac
+                        mb_vf_acc += v_loss_per_sample.mean() * w_frac
+                        mb_ent_acc += entropy.mean() * w_frac
+                        mb_kl_acc += ((ratio - 1.0) - log_ratio).mean() * w_frac
+                        mb_r_mean_acc += ratio.mean() * w_frac
+                        mb_r_max_acc = torch.maximum(mb_r_max_acc, ratio.max())
+
                 grad_norm = nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
                 optimizer.step()
 
                 with torch.no_grad():
-                    tot_losses_t[mb_i] = loss.detach()
-                    clipfracs_t[mb_i] = ((ratio - 1.0).abs() > args.clip_coef).float().mean()
-                    pg_losses_t[mb_i] = pg_loss_per_sample.mean()
-                    v_losses_t[mb_i] = v_loss_per_sample.mean()
-                    ent_losses_t[mb_i] = entropy.mean()
-                    approx_kls_t[mb_i] = ((ratio - 1.0) - log_ratio).mean()
-                    mean_ratios_t[mb_i] = ratio.mean()
-                    max_ratios_t[mb_i] = ratio.max()
+                    tot_losses_t[mb_i] = mb_loss_acc
+                    clipfracs_t[mb_i] = mb_clip_acc
+                    pg_losses_t[mb_i] = mb_pg_acc
+                    v_losses_t[mb_i] = mb_vf_acc
+                    ent_losses_t[mb_i] = mb_ent_acc
+                    approx_kls_t[mb_i] = mb_kl_acc
+                    mean_ratios_t[mb_i] = mb_r_mean_acc
+                    max_ratios_t[mb_i] = mb_r_max_acc
                     grad_norms_t[mb_i] = grad_norm
 
             epochs_used += 1
