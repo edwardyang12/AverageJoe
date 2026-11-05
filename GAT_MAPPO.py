@@ -121,6 +121,12 @@ def parse_args():
         help="FPS for recorded MP4 replay videos")
     parser.add_argument("--eval-checkpoint", type=str, default=None,
         help="optional path to a saved .pt checkpoint to immediately record replay videos and exit")
+    parser.add_argument("--init-checkpoint", type=str, default="",
+        help="optional path to a saved online .pt checkpoint to initialize/fine-tune from (works across different grid sizes!)")
+    parser.add_argument("--ema-checkpoint", type=str, default="",
+        help="optional path to a saved EMA .pt checkpoint to initialize ema_agent from")
+    parser.add_argument("--start-stage", type=int, default=0,
+        help="starting curriculum stage index (e.g., set --start-stage 3 or 4 when fine-tuning a trained 15x15 model on 24x24)")
     parser.add_argument("--eval-mode", type=str, default="selfplay", choices=["selfplay", "random"],
         help="whether recorded replay videos pit the agent against itself ('selfplay') or random ('random')")
     parser.add_argument("--num-videos", type=int, default=3,
@@ -202,11 +208,28 @@ def parse_args():
 
     # Automatically load YAML config if it exists, ONLY filling in values not overridden on CLI
     args.curriculum = [
-        {"iter": 0, "min_generals_distance": 4, "max_generals_distance": 9, "reward_fn": "composite_reward"},
-        {"iter": 500, "min_generals_distance": 9, "max_generals_distance": 17, "reward_fn": "composite_reward"},
-        {"iter": 2000, "min_generals_distance": 17, "max_generals_distance": 25, "reward_fn": "win_lose_reward"},
-        {"iter": 5000, "min_generals_distance": 17, "max_generals_distance": 35, "reward_fn": "win_lose_reward"},
+        {"iter": 0, "win_rate_threshold": None, "min_generals_distance": 2, "max_generals_distance": 6, "reward_fn": "win_lose_reward"},
+        {"iter": None, "win_rate_threshold": 0.6, "min_generals_distance": 4, "max_generals_distance": 8, "reward_fn": "win_lose_reward"},
+        {"iter": None, "win_rate_threshold": 0.6, "min_generals_distance": 6, "max_generals_distance": 13, "reward_fn": "win_lose_reward"},
+        {"iter": None, "win_rate_threshold": 0.6, "min_generals_distance": 11, "max_generals_distance": 17, "reward_fn": "win_lose_reward"},
+        {"iter": None, "win_rate_threshold": 0.6, "min_generals_distance": 17, "max_generals_distance": 28, "reward_fn": "win_lose_reward"},
     ]
+    args.lr_schedule = "cosine"
+    args.lr_power_law_numerator = 0.5
+    args.lr_power_law_exponent = 1.1
+    args.lr_power_law_min = 5e-6
+    args.lr_power_law_max = 1e-4
+    args.ent_schedule = "constant"
+    args.ent_coef_start = 0.05
+    args.ent_coef_end = 0.001
+    args.ent_coef_decay_iters = 5000
+    args.ent_power = 0.2
+    args.ent_coef_min = 0.001
+    args.mountain_density_min = 0.18
+    args.mountain_density_max = 0.22
+    args.num_cities_min = 9
+    args.num_cities_max = 11
+
     if args.config and os.path.exists(args.config):
         try:
             from ruamel.yaml import YAML
@@ -220,7 +243,13 @@ def parse_args():
                 "vf_coef", "ent_coef", "target_kl", "adv_top_frac", "lr",
                 "warmup_lr", "lr_warmup_iters", "final_lr", "lr_decay_iters",
                 "eval_every", "eval_games", "value_loss", "num_bins", "v_min",
-                "v_max", "hl_sigma",
+                "v_max", "hl_sigma", "max_grad_norm", "ema_decay",
+                "lr_schedule", "lr_power_law_numerator", "lr_power_law_exponent",
+                "lr_power_law_min", "lr_power_law_max",
+                "ent_schedule", "ent_coef_start", "ent_coef_end",
+                "ent_coef_decay_iters", "ent_power", "ent_coef_min",
+                "mountain_density_min", "mountain_density_max",
+                "num_cities_min", "num_cities_max",
             ]:
                 if k in ycfg and ycfg[k] is not None and k not in cli_provided:
                     setattr(args, k, ycfg[k])
@@ -237,19 +266,22 @@ def parse_args():
             if "ff_factor" in ycfg and "ffn_mult" not in cli_provided:
                 args.ffn_mult = int(ycfg["ff_factor"])
             if "curriculum" in ycfg and ycfg["curriculum"]:
-                # Inherit reward_fn from previous stage if not specified in a stage
+                # Support BOTH iter-based curriculum (default.yaml) AND win_rate_threshold curriculum (L_7d_gae90.yaml)!
+                # Importantly, if `reward_fn` is NOT specified in the YAML (like in L_7d_gae90.yaml),
+                # default to `win_lose_reward` just like `train/ppo.py`!
                 cur_list = []
-                last_rew = "composite_reward"
+                last_rew = "win_lose_reward"
                 for st in ycfg["curriculum"]:
                     last_rew = st.get("reward_fn", last_rew)
                     cur_list.append({
-                        "iter": int(st["iter"]),
+                        "iter": int(st["iter"]) if "iter" in st and st["iter"] is not None else None,
+                        "win_rate_threshold": float(st["win_rate_threshold"]) if "win_rate_threshold" in st and st["win_rate_threshold"] is not None else None,
                         "min_generals_distance": int(st["min_generals_distance"]),
                         "max_generals_distance": int(st["max_generals_distance"]),
                         "reward_fn": last_rew,
                     })
                 args.curriculum = cur_list
-            print(f"Synced hyperparameters & {len(args.curriculum)}-stage iter curriculum from {args.config}")
+            print(f"Synced hyperparameters & {len(args.curriculum)}-stage curriculum from {args.config}")
         except Exception as e:
             print(f"Note: Could not parse {args.config} via ruamel.yaml ({e}), using built-in config defaults.")
 
@@ -267,10 +299,14 @@ def parse_args():
 
 def compute_scheduled_lr(it: int, args) -> float:
     """
-    Exact match to your YAML config's LR schedule:
-      - Linear warmup from `warmup_lr` to `lr` over `lr_warmup_iters`
-      - Cosine decay from `lr` to `final_lr` over `lr_decay_iters`
+    Supports both:
+      1. `lr_schedule == "power_law"` (from `L_7d_gae90.yaml`: `clip(0.5 * (it+1)^-1.1, 5e-6, 1e-4)`)
+      2. Linear warmup + Cosine decay (from `default.yaml`)
     """
+    if getattr(args, "lr_schedule", "cosine") == "power_law":
+        raw = float(args.lr_power_law_numerator) * ((float(it + 1)) ** (-float(args.lr_power_law_exponent)))
+        return max(min(raw, float(args.lr_power_law_max)), float(args.lr_power_law_min))
+
     if args.lr_warmup_iters > 0 and it < args.lr_warmup_iters:
         frac = float(it + 1) / float(args.lr_warmup_iters)
         return args.warmup_lr + frac * (args.lr - args.warmup_lr)
@@ -281,6 +317,20 @@ def compute_scheduled_lr(it: int, args) -> float:
         return args.final_lr + (args.lr - args.final_lr) * cosine
     return args.lr
 
+def compute_scheduled_ent_coef(it: int, args) -> float:
+    """
+    Supports both:
+      1. `ent_schedule == "power_law"` (from `L_7d_gae90.yaml`: power-law decay from `ent_coef_start` to `ent_coef_end` over `ent_coef_decay_iters`)
+      2. Constant `ent_coef` (from `default.yaml`)
+    """
+    if getattr(args, "ent_schedule", "constant") == "power_law":
+        decay_iters = max(float(getattr(args, "ent_coef_decay_iters", 5000)), 1.0)
+        progress = min(max(float(it) / decay_iters, 0.0), 1.0)
+        start_val = float(args.ent_coef_start)
+        end_val = float(getattr(args, "ent_coef_end", args.ent_coef_min))
+        raw = start_val + (end_val - start_val) * (progress ** float(args.ent_power))
+        return max(raw, float(args.ent_coef_min))
+    return float(args.ent_coef)
 
 # =====================================================================
 # 1. FEATURE PARTITIONING & PREPROCESSING (Section 3 of Spec)
@@ -757,18 +807,21 @@ class JAXGeneralsSelfPlayVecEnv:
 
         # Initialize Stage 0 from iter-based curriculum in args
         self.curriculum_stages = args.curriculum
-        self.current_stage_idx = 0
-        s0 = self.curriculum_stages[0]
+        self.current_stage_idx = min(max(int(getattr(args, "start_stage", 0)), 0), len(self.curriculum_stages) - 1)
+        s0 = self.curriculum_stages[self.current_stage_idx]
         args.min_generals_distance = s0["min_generals_distance"]
         args.max_generals_distance = s0["max_generals_distance"]
-        self.use_composite_reward = (s0.get("reward_fn", "composite_reward") == "composite_reward")
+        self.use_composite_reward = (s0.get("reward_fn", "win_lose_reward") == "composite_reward")
 
         env_sig = inspect.signature(GeneralsEnv.__init__).parameters
+        cities_range = (int(getattr(args, "num_cities_min", 9)), int(getattr(args, "num_cities_max", 11)))
         cities_kwarg = (
-            {"num_castles_range": (9, 11)}
+            {"num_castles_range": cities_range}
             if "num_castles_range" in env_sig
-            else {"num_cities_range": (9, 11)}
+            else {"num_cities_range": cities_range}
         )
+        m_min = float(getattr(args, "mountain_density_min", 0.18))
+        m_max = float(getattr(args, "mountain_density_max", 0.22))
 
         self.env = GeneralsEnv(
             min_grid_size=args.min_grid_size,
@@ -777,9 +830,9 @@ class JAXGeneralsSelfPlayVecEnv:
             min_generals_distance=args.min_generals_distance,
             max_generals_distance=args.max_generals_distance,
             truncation=args.truncation,
-            pool_size=args.pool_size,
+            pool_size=min(int(args.pool_size), 30000),
             castle_val_range=(args.castle_val_min, args.castle_val_max),
-            mountain_density_range=(0.18, 0.22),
+            mountain_density_range=(m_min, m_max),
             **cities_kwarg,
         )
 
@@ -1120,31 +1173,44 @@ class JAXGeneralsSelfPlayVecEnv:
 
     def update_curriculum_by_iter(self, it: int):
         """
-        Advances curriculum stage based on the exact `iter:` schedule in your YAML config:
-          - iter 0: dist 4-9, composite_reward
-          - iter 500: dist 9-17, composite_reward
-          - iter 2000: dist 17-25, win_lose_reward
-          - iter 5000: dist 17-35, win_lose_reward
+        Advances curriculum stage if the next stage uses an `iter:` trigger (`default.yaml`).
         """
         target_idx = self.current_stage_idx
         for idx, st in enumerate(self.curriculum_stages):
-            if it >= st["iter"]:
-                target_idx = idx
+            if st.get("iter") is not None and it >= st["iter"]:
+                target_idx = max(target_idx, idx)
         if target_idx != self.current_stage_idx:
-            self.current_stage_idx = target_idx
-            st = self.curriculum_stages[target_idx]
-            min_d, max_d = st["min_generals_distance"], st["max_generals_distance"]
-            rew_name = st.get("reward_fn", "win_lose_reward")
-            self.use_composite_reward = (rew_name == "composite_reward")
-            self.env.min_generals_distance = min_d
-            self.env.max_generals_distance = max_d
-            self.regenerate_pool()
-            print(
-                f"--> CURRICULUM STAGE {target_idx} (iter {it}): "
-                f"spawn distance [{min_d}, {max_d}], reward_fn={rew_name}"
-            )
+            self._apply_curriculum_stage(target_idx, trigger_str=f"iter {it}")
+
+    def advance_curriculum_by_win_rate(self, eval_wr: float, it: int):
+        """
+        Advances curriculum stage if the next stage uses a `win_rate_threshold:` trigger (`L_7d_gae90.yaml`).
+        """
+        next_idx = self.current_stage_idx + 1
+        if next_idx < len(self.curriculum_stages):
+            st = self.curriculum_stages[next_idx]
+            thresh = st.get("win_rate_threshold")
+            if thresh is not None and eval_wr >= thresh:
+                self._apply_curriculum_stage(next_idx, trigger_str=f"iter {it}, eval_wr={eval_wr*100:.1f}% >= {thresh*100:.0f}%")
+
+    def _apply_curriculum_stage(self, stage_idx: int, trigger_str: str):
+        self.current_stage_idx = stage_idx
+        st = self.curriculum_stages[stage_idx]
+        min_d, max_d = st["min_generals_distance"], st["max_generals_distance"]
+        rew_name = st.get("reward_fn", "win_lose_reward")
+        self.use_composite_reward = (rew_name == "composite_reward")
+        self.env.min_generals_distance = min_d
+        self.env.max_generals_distance = max_d
+        self.regenerate_pool()
+        print(
+            f"--> CURRICULUM STAGE {stage_idx} ({trigger_str}): "
+            f"spawn distance [{min_d}, {max_d}], reward_fn={rew_name}"
+        )
 
     def regenerate_pool(self):
+        # Clear dead JAX/PyTorch buffers before regenerating large map pool to prevent BFC allocator freeze at ~1.5K iters
+        self.pool = None
+        gc.collect()
         self.key, pool_key = jrandom.split(self.key)
         self.pool, _ = self.env.reset(pool_key)
 
@@ -1453,6 +1519,9 @@ class EloLeagueTracker:
         return self.current_elo, last_ckpt_wr, results
 
 
+_PERSISTENT_REPLAY_GUI = None
+
+
 @torch.no_grad()
 def record_replay_video_headless(
     agent: GeneralsMARLGATAgent,
@@ -1463,8 +1532,10 @@ def record_replay_video_headless(
 ):
     """
     Records a single full game replay to MP4 (or GIF fallback) inside a screenless
-    Docker container using `SDL_VIDEODRIVER="dummy"` and `ReplayGUI`.
+    Docker container using `SDL_VIDEODRIVER="dummy"` and a persistent `ReplayGUI`
+    (avoids repeated pygame.init()/pygame.quit() SDL deadlocks after 1500+ iterations).
     """
+    global _PERSISTENT_REPLAY_GUI
     if not isinstance(envs, JAXGeneralsSelfPlayVecEnv):
         return
     os.environ["SDL_VIDEODRIVER"] = "dummy"
@@ -1488,7 +1559,11 @@ def record_replay_video_headless(
     osp1 = jax.tree.map(lambda x: x[None, ...], single_obs_st)
 
     labels = ["GAT (Red)", "GAT (Blue)" if mode == "selfplay" else "Random (Blue)"]
-    gui = ReplayGUI(state, agent_ids=labels)
+    if _PERSISTENT_REPLAY_GUI is None:
+        _PERSISTENT_REPLAY_GUI = ReplayGUI(state, agent_ids=labels)
+    else:
+        _PERSISTENT_REPLAY_GUI.update(state)
+    gui = _PERSISTENT_REPLAY_GUI
     frames = []
 
     def _grab():
@@ -1502,7 +1577,7 @@ def record_replay_video_headless(
     gui.tick(fps=None)
     frames.append(_grab())
 
-    max_steps = envs.args.truncation
+    max_steps = min(envs.args.truncation, 1024)
     winner = -1
     for step in range(max_steps):
         states_b = jax.tree.map(lambda x: x[None, ...], state)
@@ -1560,19 +1635,20 @@ def record_replay_video_headless(
 
     for _ in range(fps):
         frames.append(frames[-1])
-    gui.close()
     agent.train()
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     outcome = "P0Win" if winner == 0 else "P1Win" if winner == 1 else "Draw"
     final_path = out_path.replace(".mp4", f"_{outcome}_{step + 1}steps.mp4")
     try:
-        imageio.mimsave(final_path, frames, fps=fps, macro_block_size=1)
-        print(f"  [Replay Video Saved] -> {final_path} ({len(frames)} frames)")
+        with imageio.get_writer(final_path, fps=fps, macro_block_size=1) as vid_writer:
+            for fr in frames:
+                vid_writer.append_data(fr)
+        print(f"  [Replay Video Saved] -> {final_path} ({len(frames)} frames)", flush=True)
     except Exception as e:
         gif_path = final_path.replace(".mp4", ".gif")
         imageio.mimsave(gif_path, frames, fps=fps)
-        print(f"  [Replay GIF Saved ({e})] -> {gif_path} ({len(frames)} frames)")
+        print(f"  [Replay GIF Saved ({e})] -> {gif_path} ({len(frames)} frames)", flush=True)
 
 
 # =====================================================================
@@ -1625,7 +1701,22 @@ if __name__ == "__main__":
 
     # 2. Initialize Fast 5x5 GAT Agent & EMA Shadow Agent
     agent = GeneralsMARLGATAgent(args, already_normalized_obs=AVERAGEJOE_BUNDLE_AVAILABLE).to(device)
+    if getattr(args, "init_checkpoint", ""):
+        ckpt_p = args.init_checkpoint
+        if os.path.exists(ckpt_p):
+            raw_sd = torch.load(ckpt_p, map_location=device)
+            clean_sd = {k.replace("_orig_mod.", ""): v for k, v in raw_sd.items()}
+            agent.load_state_dict(clean_sd, strict=False)
+            print(f"--> Loaded initial online weights from {ckpt_p} (grid-size agnostic transfer!)")
+
     ema_agent = copy.deepcopy(agent).to(device)
+    if getattr(args, "ema_checkpoint", ""):
+        ema_p = args.ema_checkpoint
+        if os.path.exists(ema_p):
+            raw_ema = torch.load(ema_p, map_location=device)
+            clean_ema = {k.replace("_orig_mod.", ""): v for k, v in raw_ema.items()}
+            ema_agent.load_state_dict(clean_ema, strict=False)
+            print(f"--> Loaded initial EMA weights from {ema_p}")
     for p in ema_agent.parameters():
         p.requires_grad_(False)
 
@@ -1693,7 +1784,7 @@ if __name__ == "__main__":
     train_start = time.time()
 
     for it in range(args.num_iters):
-        # Advance curriculum strictly by iteration schedule (`iter: 0, 500, 2000, 5000` in config)
+        # Advance curriculum if using iter-based schedule (`default.yaml`)
         if isinstance(envs, JAXGeneralsSelfPlayVecEnv):
             envs.update_curriculum_by_iter(it)
 
@@ -1703,7 +1794,8 @@ if __name__ == "__main__":
             n_maps = max(min(args.eval_games // 2, envs.num_envs), 1)
             print(
                 f"  EVAL (iter {it}): {ew}W/{el}L/{ed}D ({eval_wr * 100:.0f}%) greedy vs random | "
-                f"Maps({n_maps}): {wb}WB/{lb}LB/{sp}S"
+                f"Maps({n_maps}): {wb}WB/{lb}LB/{sp}S",
+                flush=True,
             )
             writer.add_scalar("eval/win_rate", eval_wr, it)
             writer.add_scalar("eval/wins", ew, it)
@@ -1713,6 +1805,10 @@ if __name__ == "__main__":
             writer.add_scalar("eval/lost_both", lb / n_maps, it)
             writer.add_scalar("eval/split", sp / n_maps, it)
 
+            # Advance curriculum if using win_rate_threshold schedule (`L_7d_gae90.yaml`)
+            if isinstance(envs, JAXGeneralsSelfPlayVecEnv):
+                envs.advance_curriculum_by_win_rate(eval_wr, it)
+
             # Run Historical Elo League evaluation every `elo_eval_every` iterations
             if args.elo_eval_every > 0 and (it + 1) % args.elo_eval_every == 0:
                 cur_elo, vs_prev_wr, h2h_summary = elo_league.evaluate_and_update_elo(
@@ -1721,7 +1817,7 @@ if __name__ == "__main__":
                 opp_strs = " | ".join(
                     [f"vs {name}({o_elo:.0f}): {w}W/{l}L/{d}D" for name, o_elo, w, l, d in h2h_summary]
                 )
-                print(f"  ELO LEAGUE (iter {it + 1}): EMA Elo = {cur_elo:.0f} | {opp_strs}")
+                print(f"  ELO LEAGUE (iter {it + 1}): EMA Elo = {cur_elo:.0f} | {opp_strs}", flush=True)
                 writer.add_scalar("eval/elo", cur_elo, it + 1)
                 writer.add_scalar("eval/vs_prev_ckpt_wr", vs_prev_wr, it + 1)
                 elo_league.add_snapshot(f"iter_{it + 1}", ema_agent, elo=cur_elo)
@@ -1745,7 +1841,7 @@ if __name__ == "__main__":
         for param_group in optimizer.param_groups:
             param_group["lr"] = current_lr
 
-        current_ent_coef = args.ent_coef
+        current_ent_coef = compute_scheduled_ent_coef(it, args)
 
         # ---- PHASE 1: Rollout Collection ----
         t_rollout = time.time()
