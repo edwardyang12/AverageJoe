@@ -101,6 +101,8 @@ def parse_args():
         help="episode step truncation limit (1024 in config)")
     parser.add_argument("--allow-pass", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="whether to allow voluntary pass (restricted to a single pass logit at [0,0,0] so entropy stays low)")
+    parser.add_argument("--castle-capture-bonus", type=float, default=0.0,
+        help="optional small positive bonus (e.g. 0.05) per newly captured castle to encourage castle discovery on 24x24 boards (0.0 = pure win_lose_reward)")
     parser.add_argument("--pool-size", type=int, default=50000,
         help="pre-generated map pool size on GPU")
     parser.add_argument("--reset-pool-every", type=int, default=10,
@@ -219,11 +221,11 @@ def parse_args():
     args.lr_power_law_exponent = 1.1
     args.lr_power_law_min = 5e-6
     args.lr_power_law_max = 1e-4
-    args.ent_schedule = "constant"
-    args.ent_coef_start = 0.05
-    args.ent_coef_end = 0.001
-    args.ent_coef_decay_iters = 5000
-    args.ent_power = 0.2
+    args.ent_schedule = "cosine"
+    args.ent_coef_start = 0.010
+    args.ent_coef_end = 0.002
+    args.ent_coef_decay_iters = 1500
+    args.ent_power = 0.5
     args.ent_coef_min = 0.001
     args.mountain_density_min = 0.18
     args.mountain_density_max = 0.22
@@ -319,16 +321,19 @@ def compute_scheduled_lr(it: int, args) -> float:
 
 def compute_scheduled_ent_coef(it: int, args) -> float:
     """
-    Supports both:
-      1. `ent_schedule == "power_law"` (from `L_7d_gae90.yaml`: power-law decay from `ent_coef_start` to `ent_coef_end` over `ent_coef_decay_iters`)
-      2. Constant `ent_coef` (from `default.yaml`)
+    Supports "power_law", "cosine", and "constant" entropy schedules.
     """
-    if getattr(args, "ent_schedule", "constant") == "power_law":
-        decay_iters = max(float(getattr(args, "ent_coef_decay_iters", 5000)), 1.0)
+    sched = getattr(args, "ent_schedule", "constant")
+    if sched in ("power_law", "cosine"):
+        decay_iters = max(float(getattr(args, "ent_coef_decay_iters", 1500)), 1.0)
         progress = min(max(float(it) / decay_iters, 0.0), 1.0)
-        start_val = float(args.ent_coef_start)
+        start_val = float(getattr(args, "ent_coef_start", args.ent_coef))
         end_val = float(getattr(args, "ent_coef_end", args.ent_coef_min))
-        raw = start_val + (end_val - start_val) * (progress ** float(args.ent_power))
+        if sched == "cosine":
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            raw = end_val + (start_val - end_val) * cosine
+        else:
+            raw = start_val + (end_val - start_val) * (progress ** float(args.ent_power))
         return max(raw, float(args.ent_coef_min))
     return float(args.ent_coef)
 
@@ -1049,6 +1054,27 @@ class JAXGeneralsSelfPlayVecEnv:
                 r_p0 = r_term_p0 + jnp.where(use_composite_flag, r_shaping_p0, 0.0)
                 r_p1 = -r_p0
 
+            castle_bonus_coef = float(getattr(self.args, "castle_capture_bonus", 0.0))
+            if castle_bonus_coef > 0.0:
+                # 1. Detect neutral castles cracked on this step (neutral -> owned by P0 or P1).
+                # Cracking a neutral castle costs 40-50 army units, whereas stealing an owned
+                # castle only costs ~2 units. We reward cracking neutral castles 3x higher
+                # (strictly zero-sum) so the agent is compensated for the 45-troop investment!
+                prev_neutral_castles = prev_castles_p0 * prev_raw_p0.neutral_cells
+                new_p0_from_neutral = jnp.sum(prev_neutral_castles * post_raw_p0.owned_cells, axis=(1, 2)).astype(jnp.float32)
+                new_p1_from_neutral = jnp.sum(prev_neutral_castles * post_raw_p0.opponent_cells, axis=(1, 2)).astype(jnp.float32)
+                d_neutral_crack_p0 = new_p0_from_neutral - new_p1_from_neutral
+
+                # 2. Zero-sum potential difference for total city advantage
+                d_city_adv_p0 = (owned_cities_p0 - owned_cities_p1) - (prev_cities_p0 - prev_cities_p1)
+                r_castle_p0 = jnp.where(
+                    dones,
+                    0.0,
+                    castle_bonus_coef * (3.0 * d_neutral_crack_p0 + d_city_adv_p0),
+                )
+                r_p0 = r_p0 + r_castle_p0
+                r_p1 = r_p1 - r_castle_p0
+
             rewards = jnp.concatenate([r_p0, r_p1], axis=0)
             term_both = jnp.concatenate([terminated, terminated], axis=0)
             trunc_both = jnp.concatenate([truncated, truncated], axis=0)
@@ -1722,7 +1748,9 @@ if __name__ == "__main__":
 
     # Initialize Historical Checkpoint Elo League Tracker (uses uncompiled ema_agent template)
     elo_league = EloLeagueTracker(ema_agent, device=device, max_snapshots=args.max_league_snapshots)
-    elo_league.add_snapshot("iter_0", ema_agent, elo=1000.0)
+    init_base_elo = 1340.0 if getattr(args, "init_checkpoint", "") else 1000.0
+    elo_league.current_elo = init_base_elo
+    elo_league.add_snapshot("iter_0", ema_agent, elo=init_base_elo)
 
     total_params = sum(p.numel() for p in agent.parameters())
     print(f"Initialized GeneralsMARLGATAgent ({H}x{W} grid) with {total_params / 1e6:.2f}M parameters on {device}.")
@@ -2081,6 +2109,8 @@ if __name__ == "__main__":
             "train/loss_rate": lr_stat,
             "train/draw_rate": dr,
             "train/mean_owned_cities": mean_owned_cities,
+            "train/elo": float(elo_league.current_elo),
+            "train/curriculum_stage": float(getattr(envs, "current_stage_idx", 0)),
             "train/sps": float(sps),
             "train/ent_coef": current_ent_coef,
             "train/lr": current_lr,
@@ -2091,6 +2121,7 @@ if __name__ == "__main__":
 
         wall = int(time.time() - train_start)
         hh, mm, ss = wall // 3600, (wall % 3600) // 60, wall % 60
+        cur_stg = getattr(envs, "current_stage_idx", 0)
         print(
             f"[{hh:02d}:{mm:02d}:{ss:02d}] Iter {it + 1:3d}/{args.num_iters} | Loss: {log_metrics['train/total_loss']:.4f} | "
             f"PG: {log_metrics['train/policy_loss']:.4f} | "
@@ -2104,9 +2135,12 @@ if __name__ == "__main__":
             f"Eps: {eps_p0:3d} | W/L/D: {wins_p0}/{losses_p0}/{draws_p0} ({wr * 100:.0f}%/{lr_stat * 100:.0f}%/{dr * 100:.0f}%) | "
             f"EpLen: {mean_ep_len:.0f} | "
             f"Cities: {mean_owned_cities:.2f} | "
+            f"Elo: {elo_league.current_elo:.0f} | "
+            f"Stg: {cur_stg} | "
             f"Epochs: {epochs_used}/{args.update_epochs} | "
             f"LR: {current_lr:.1e} | "
-            f"SPS: {sps:.0f} | {elapsed:.2f}s (rollout {t_rollout:.2f}s, ppo {t_ppo:.2f}s)"
+            f"SPS: {sps:.0f} | {elapsed:.2f}s (rollout {t_rollout:.2f}s, ppo {t_ppo:.2f}s)",
+            flush=True,
         )
 
         if (it + 1) % 250 == 0 or (it + 1) == args.num_iters:
