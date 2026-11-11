@@ -163,7 +163,7 @@ def parse_args():
         help="target KL divergence threshold for early epoch stopping")
     parser.add_argument("--gamma", type=float, default=0.999,
         help="discount factor gamma (0.999 in config)")
-    parser.add_argument("--gae-lambda", type=float, default=0.9,
+    parser.add_argument("--gae-lambda", type=float, default=0.95,
         help="lambda for Generalized Advantage Estimation")
     parser.add_argument("--clip-coef", type=float, default=0.2,
         help="PPO surrogate clipping coefficient epsilon")
